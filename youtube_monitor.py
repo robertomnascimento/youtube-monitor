@@ -6,13 +6,14 @@ Monitora canais do YouTube, gera resumos com Claude e envia por e-mail
 
 import os
 import json
+import smtplib
 from datetime import datetime, timedelta, timezone
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.oauth2.service_account import Credentials
 from anthropic import Anthropic
-import base64
-from email.mime.text import MIMEText
 
 
 class YouTubeMonitor:
@@ -53,7 +54,6 @@ class YouTubeMonitor:
             credentials_path,
             scopes=[
                 "https://www.googleapis.com/auth/youtube.readonly",
-                "https://www.googleapis.com/auth/gmail.send",
                 "https://www.googleapis.com/auth/drive.file",
             ],
         )
@@ -64,7 +64,6 @@ class YouTubeMonitor:
             credentials = credentials.with_subject(delegated_email)
 
         self.youtube = build("youtube", "v3", credentials=credentials)
-        self.gmail = build("gmail", "v1", credentials=credentials)
         self.drive = build("drive", "v3", credentials=credentials)
         print("✅ APIs Google configuradas")
 
@@ -200,21 +199,24 @@ class YouTubeMonitor:
         return html
 
     def send_email(self, to_email, subject, html_body):
-        """Envia e-mail via Gmail"""
-        if not self.gmail:
-            print("⚠️  Gmail não configurado")
+        """Envia e-mail via SMTP do Gmail com senha de app"""
+        smtp_user = os.getenv("GMAIL_USER") or self.config.get("gmail_user", "")
+        smtp_password = os.getenv("GMAIL_APP_PASSWORD") or self.config.get("gmail_app_password", "")
+
+        if not smtp_user or not smtp_password:
+            print("⚠️  GMAIL_USER ou GMAIL_APP_PASSWORD não configurados")
             return False
 
         try:
-            message = MIMEText(html_body, "html")
+            message = MIMEMultipart("alternative")
             message["to"] = to_email
+            message["from"] = smtp_user
             message["subject"] = subject
+            message.attach(MIMEText(html_body, "html"))
 
-            raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
-
-            self.gmail.users().messages().send(
-                userId="me", body={"raw": raw_message}
-            ).execute()
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+                server.login(smtp_user, smtp_password)
+                server.sendmail(smtp_user, to_email, message.as_string())
 
             print(f"✅ E-mail enviado para {to_email}")
             return True

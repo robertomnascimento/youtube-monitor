@@ -32,6 +32,8 @@ jobs:
         CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
         GOOGLE_CREDENTIALS_PATH: credentials/google_credentials.json
         CONFIG_FILE: config.json
+        GMAIL_USER: ${{ secrets.GMAIL_USER }}
+        GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
       run: python youtube_monitor.py
 
     - name: Upload summaries as artifact

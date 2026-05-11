@@ -1,0 +1,318 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2867
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;\f1\fnil\fcharset0 AppleColorEmoji;\f2\fnil\fcharset0 LucidaGrande;
+}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 #!/usr/bin/env python3\
+"""\
+YouTube Channel Monitor\
+Monitora canais do YouTube, gera resumos com Claude e envia por e-mail\
+"""\
+\
+import os\
+import json\
+from datetime import datetime, timedelta\
+from googleapiclient.discovery import build\
+from google.oauth2.service_account import Credentials\
+from google.auth.transport.requests import Request\
+from anthropic import Anthropic\
+import base64\
+from email.mime.text import MIMEText\
+\
+\
+class YouTubeMonitor:\
+    def __init__(self):\
+        self.claude = Anthropic(api_key=os.getenv("CLAUDE_API_KEY"))\
+        self.youtube = None\
+        self.gmail = None\
+        self.drive = None\
+        self.config = self.load_config()\
+        self.setup_google_apis()\
+\
+    def load_config(self):\
+        """Carrega configura\'e7\'e3o do arquivo JSON"""\
+        config_file = os.getenv("CONFIG_FILE", "config.json")\
+        try:\
+            with open(config_file, "r", encoding="utf-8") as f:\
+                return json.load(f)\
+        except FileNotFoundError:\
+            print(f"
+\f1 \uc0\u9888 \u65039 
+\f0   Arquivo \{config_file\} n\'e3o encontrado!")\
+            return \{"channels": [], "email_to": ""\}\
+\
+    def setup_google_apis(self):\
+        """Configura APIs do Google usando credenciais"""\
+        credentials_path = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials/google_credentials.json")\
+\
+        if not os.path.exists(credentials_path):\
+            print(f"
+\f1 \uc0\u9888 \u65039 
+\f0   Credenciais n\'e3o encontradas em \{credentials_path\}")\
+            return\
+\
+        credentials = Credentials.from_service_account_file(\
+            credentials_path,\
+            scopes=[\
+                "https://www.googleapis.com/auth/youtube.readonly",\
+                "https://www.googleapis.com/auth/gmail.send",\
+                "https://www.googleapis.com/auth/drive.file"\
+            ]\
+        )\
+\
+        self.youtube = build("youtube", "v3", credentials=credentials)\
+        self.gmail = build("gmail", "v1", credentials=credentials)\
+        self.drive = build("drive", "v3", credentials=credentials)\
+        print("
+\f1 \uc0\u9989 
+\f0  APIs Google configuradas")\
+\
+    def get_channel_id(self, channel_handle):\
+        """Obt\'e9m o ID do canal a partir do handle"""\
+        try:\
+            response = self.youtube.search().list(\
+                part="snippet",\
+                q=f"@\{channel_handle\}",\
+                type="channel",\
+                maxResults=1\
+            ).execute()\
+\
+            if response["items"]:\
+                return response["items"][0]["id"]["channelId"]\
+        except Exception as e:\
+            print(f"
+\f1 \uc0\u10060 
+\f0  Erro ao buscar canal \{channel_handle\}: \{e\}")\
+        return None\
+\
+    def get_recent_videos(self, channel_id, hours=24):\
+        """Busca v\'eddeos publicados nas \'faltimas N horas"""\
+        try:\
+            published_after = (datetime.utcnow() - timedelta(hours=hours)).isoformat() + "Z"\
+\
+            response = self.youtube.search().list(\
+                part="snippet",\
+                channelId=channel_id,\
+                publishedAfter=published_after,\
+                order="date",\
+                type="video",\
+                maxResults=10\
+            ).execute()\
+\
+            videos = []\
+            for item in response.get("items", []):\
+                videos.append(\{\
+                    "title": item["snippet"]["title"],\
+                    "description": item["snippet"]["description"],\
+                    "video_id": item["id"]["videoId"],\
+                    "published_at": item["snippet"]["publishedAt"],\
+                    "channel_title": item["snippet"]["channelTitle"]\
+                \})\
+            return videos\
+        except Exception as e:\
+            print(f"
+\f1 \uc0\u10060 
+\f0  Erro ao buscar v\'eddeos: \{e\}")\
+            return []\
+\
+    def summarize_video(self, title, description):\
+        """Gera resumo do v\'eddeo usando Claude"""\
+        try:\
+            message = self.claude.messages.create(\
+                model="claude-3-5-sonnet-20241022",\
+                max_tokens=300,\
+                messages=[\
+                    \{\
+                        "role": "user",\
+                        "content": f"""Fa\'e7a um resumo conciso (2-3 linhas) deste v\'eddeo do YouTube em portugu\'eas:\
+\
+T\'edtulo: \{title\}\
+Descri\'e7\'e3o: \{description\}\
+\
+Resumo:"""\
+                    \}\
+                ]\
+            )\
+            return message.content[0].text.strip()\
+        except Exception as e:\
+            print(f"
+\f1 \uc0\u10060 
+\f0  Erro ao resumir: \{e\}")\
+            return "N\'e3o foi poss\'edvel gerar resumo"\
+\
+    def monitor_channels(self):\
+        """Monitora todos os canais e coleta v\'eddeos novos"""\
+        all_videos = \{\}\
+\
+        for channel_handle in self.config.get("channels", []):\
+            print(f"\\n
+\f1 \uc0\u55357 \u56570 
+\f0  Monitorando: @\{channel_handle\}")\
+\
+            channel_id = self.get_channel_id(channel_handle)\
+            if not channel_id:\
+                print(f"
+\f1 \uc0\u9888 \u65039 
+\f0   Canal n\'e3o encontrado: \{channel_handle\}")\
+                continue\
+\
+            videos = self.get_recent_videos(channel_id)\
+            if videos:\
+                print(f"
+\f1 \uc0\u9989 
+\f0  Encontrados \{len(videos)\} v\'eddeos novos")\
+                all_videos[channel_handle] = videos\
+            else:\
+                print(f"
+\f1 \uc0\u8505 \u65039 
+\f0   Nenhum v\'eddeo novo nas \'faltimas 24h")\
+\
+        return all_videos\
+\
+    def create_email_body(self, videos_by_channel):\
+        """Cria o corpo do e-mail com resumos"""\
+        if not videos_by_channel:\
+            return "<p>Nenhum v\'eddeo novo nos canais monitorados.</p>"\
+\
+        html = "<html><body style='font-family: Arial, sans-serif;'>"\
+        html += f"<h2>
+\f1 \uc0\u55357 \u56522 
+\f0  Resumo de V\'eddeos - \{datetime.now().strftime('%d/%m/%Y')\}</h2>"\
+\
+        for channel, videos in videos_by_channel.items():\
+            html += f"<h3>@\{channel\}</h3>"\
+            for video in videos:\
+                summary = self.summarize_video(video["title"], video["description"])\
+                html += f"""\
+                <div style='border-left: 3px solid #1f1f1f; padding-left: 10px; margin: 15px 0;'>\
+                    <p><strong>
+\f1 \uc0\u55356 \u57260 
+\f0  \{video['title']\}</strong></p>\
+                    <p style='color: #666;'>\{summary\}</p>\
+                    <p><small>
+\f1 \uc0\u55357 \u56517 
+\f0  \{video['published_at'][:10]\}</small></p>\
+                    <p><a href='https://youtube.com/watch?v=\{video["video_id"]\}'>Assistir no YouTube 
+\f2 \uc0\u8594 
+\f0 </a></p>\
+                </div>\
+                """\
+\
+        html += "</body></html>"\
+        return html\
+\
+    def send_email(self, to_email, subject, html_body):\
+        """Envia e-mail via Gmail"""\
+        if not self.gmail:\
+            print("
+\f1 \uc0\u9888 \u65039 
+\f0   Gmail n\'e3o configurado")\
+            return False\
+\
+        try:\
+            message = MIMEText(html_body, "html")\
+            message["to"] = to_email\
+            message["subject"] = subject\
+\
+            raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()\
+\
+            self.gmail.users().messages().send(\
+                userId="me",\
+                body=\{"raw": raw_message\}\
+            ).execute()\
+\
+            print(f"
+\f1 \uc0\u9989 
+\f0  E-mail enviado para \{to_email\}")\
+            return True\
+        except Exception as e:\
+            print(f"
+\f1 \uc0\u10060 
+\f0  Erro ao enviar e-mail: \{e\}")\
+            return False\
+\
+    def save_to_drive(self, filename, content):\
+        """Salva o resumo no Google Drive"""\
+        if not self.drive:\
+            print("
+\f1 \uc0\u9888 \u65039 
+\f0   Google Drive n\'e3o configurado")\
+            return False\
+\
+        try:\
+            folder_id = self.config.get("google_drive_folder_id")\
+            if not folder_id:\
+                print("
+\f1 \uc0\u9888 \u65039 
+\f0   Google Drive Folder ID n\'e3o configurado")\
+                return False\
+\
+            file_metadata = \{\
+                "name": filename,\
+                "parents": [folder_id]\
+            \}\
+\
+            file = self.drive.files().create(\
+                body=file_metadata,\
+                media_body=content,\
+                fields="id"\
+            ).execute()\
+\
+            print(f"
+\f1 \uc0\u9989 
+\f0  Arquivo salvo no Google Drive: \{filename\}")\
+            return True\
+        except Exception as e:\
+            print(f"
+\f1 \uc0\u10060 
+\f0  Erro ao salvar no Drive: \{e\}")\
+            return False\
+\
+    def run(self):\
+        """Executa o monitoramento completo"""\
+        print("
+\f1 \uc0\u55357 \u56960 
+\f0  Iniciando monitoramento de canais YouTube...")\
+\
+        # Coleta v\'eddeos\
+        videos = self.monitor_channels()\
+\
+        if not videos:\
+            print("
+\f1 \uc0\u8505 \u65039 
+\f0   Nenhum v\'eddeo novo encontrado")\
+            return\
+\
+        # Cria corpo do e-mail\
+        email_body = self.create_email_body(videos)\
+\
+        # Envia e-mail\
+        email = self.config.get("email_to")\
+        subject = self.config.get("email_subject", "Resumo de V\'eddeos").format(data=datetime.now().strftime("%d/%m/%Y"))\
+        if email:\
+            self.send_email(email, subject, email_body)\
+\
+        # Salva no Drive e localmente\
+        os.makedirs("summaries", exist_ok=True)\
+        filename = f"resumo_\{datetime.now().strftime('%Y%m%d_%H%M%S')\}.html"\
+        filepath = f"summaries/\{filename\}"\
+\
+        with open(filepath, "w", encoding="utf-8") as f:\
+            f.write(email_body)\
+        print(f"
+\f1 \uc0\u9989 
+\f0  Resumo salvo localmente: \{filepath\}")\
+\
+        self.save_to_drive(filename, filepath)\
+\
+        print("\\n
+\f1 \uc0\u10024 
+\f0  Monitoramento conclu\'eddo!")\
+\
+\
+if __name__ == "__main__":\
+    monitor = YouTubeMonitor()\
+    monitor.run()}

@@ -11,8 +11,11 @@ Monitora canais do YouTube, gera resumos com Claude e alimenta Google Sheets.
 
 import os
 import json
+import smtplib
 import requests
 from datetime import datetime, timedelta, timezone
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
 from anthropic import Anthropic
@@ -410,9 +413,12 @@ class YouTubeMonitor:
         return worksheet, existing_links, existing_channels
 
     def add_to_sheets(self, videos_by_channel, worksheet, existing_links):
-        """Adiciona vídeos novos à planilha e registra observações no Hubspot"""
+        """Adiciona vídeos novos à planilha e registra observações no Hubspot.
+
+        Retorna a lista de registros adicionados (para o extrato diário)."""
         new_count = 0
         skipped_count = 0
+        added = []
 
         for channel_handle, videos in videos_by_channel.items():
             for video in videos:
@@ -479,12 +485,122 @@ class YouTubeMonitor:
                 worksheet.append_row(row)
                 existing_links.add(video_link)
                 new_count += 1
+                added.append(
+                    {
+                        "channel": channel_handle,
+                        "date": pub_date,
+                        "assunto": info.get("assunto", ""),
+                        "resumo": info.get("resumo", ""),
+                        "entrevistado": info.get("entrevistado") or "",
+                        "contact_hubspot": contact_exists,
+                        "empresa": info.get("empresa_mencionada") or "",
+                        "company_hubspot": company_exists,
+                        "owner": owner_name or "",
+                        "link": video_link,
+                    }
+                )
                 print(f"✅ Adicionado: {info.get('assunto', '')} - {channel_handle}")
 
         print(
             f"✅ Planilha atualizada: {new_count} novos, "
             f"{skipped_count} já registrados (ignorados)"
         )
+        return added
+
+    # ------------------------------------------------------------------
+    # Extrato diário por e-mail
+    # ------------------------------------------------------------------
+
+    def build_digest_html(self, added):
+        """Monta o HTML do extrato diário"""
+        today = datetime.now(timezone.utc).strftime("%d/%m/%Y")
+        spreadsheet_id = os.getenv("GOOGLE_SHEETS_ID") or self.config.get("spreadsheet_id", "")
+        sheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
+
+        html = "<html><body style='font-family: Arial, sans-serif; color: #333;'>"
+        html += f"<h2>📺 Extrato YouTube Monitor — {today}</h2>"
+
+        if not added:
+            html += "<p>Nenhum vídeo novo encontrado hoje nos canais monitorados. ✅</p>"
+        else:
+            hubspot_hits = [v for v in added if v["company_hubspot"] or v["contact_hubspot"]]
+            html += (
+                f"<p><strong>{len(added)}</strong> vídeo(s) novo(s) adicionado(s) à planilha"
+                + (
+                    f", <strong>{len(hubspot_hits)}</strong> com correspondência no Hubspot 🎯"
+                    if hubspot_hits
+                    else ""
+                )
+                + ".</p>"
+            )
+
+            # Destaques: vídeos com match no Hubspot primeiro
+            for v in sorted(added, key=lambda x: not (x["company_hubspot"] or x["contact_hubspot"])):
+                badge = ""
+                if v["company_hubspot"]:
+                    badge += " 🏢 <strong>Empresa no Hubspot</strong>"
+                    if v["owner"]:
+                        badge += f" (resp.: {v['owner']})"
+                if v["contact_hubspot"]:
+                    badge += " 👤 <strong>Contato no Hubspot</strong>"
+
+                html += (
+                    f"<div style='border-left: 3px solid "
+                    f"{'#ff7a59' if badge else '#ccc'}; padding-left: 12px; margin: 14px 0;'>"
+                    f"<p style='margin: 2px 0;'><strong>{v['assunto']}</strong> "
+                    f"<small>(@{v['channel']}, {v['date']})</small></p>"
+                    f"<p style='margin: 2px 0; color: #555;'>{v['resumo']}</p>"
+                )
+                details = []
+                if v["entrevistado"]:
+                    details.append(f"Entrevistado: {v['entrevistado']}")
+                if v["empresa"]:
+                    details.append(f"Empresa: {v['empresa']}")
+                if details:
+                    html += f"<p style='margin: 2px 0;'><small>{' | '.join(details)}</small></p>"
+                if badge:
+                    html += f"<p style='margin: 2px 0;'>{badge}</p>"
+                html += (
+                    f"<p style='margin: 2px 0;'><a href='{v['link']}'>Assistir →</a></p>"
+                    f"</div>"
+                )
+
+        html += (
+            f"<hr><p><a href='{sheet_url}'>📊 Abrir planilha completa</a></p>"
+            f"<p style='color: #999; font-size: 12px;'>Enviado automaticamente pelo YouTube Monitor</p>"
+            f"</body></html>"
+        )
+        return html
+
+    def send_digest_email(self, added):
+        """Envia o extrato diário por e-mail via SMTP do Gmail"""
+        to_email = self.config.get("email_to")
+        smtp_user = os.getenv("GMAIL_USER") or self.config.get("gmail_user", "")
+        smtp_password = os.getenv("GMAIL_APP_PASSWORD", "")
+
+        if not to_email or not smtp_user or not smtp_password:
+            print("⚠️  E-mail não configurado (email_to / GMAIL_USER / GMAIL_APP_PASSWORD)")
+            return False
+
+        today = datetime.now(timezone.utc).strftime("%d/%m/%Y")
+        subject = f"📺 YouTube Monitor: {len(added)} vídeo(s) novo(s) — {today}"
+
+        try:
+            message = MIMEMultipart("alternative")
+            message["to"] = to_email
+            message["from"] = smtp_user
+            message["subject"] = subject
+            message.attach(MIMEText(self.build_digest_html(added), "html"))
+
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+                server.login(smtp_user, smtp_password)
+                server.sendmail(smtp_user, to_email, message.as_string())
+
+            print(f"✅ Extrato enviado para {to_email}")
+            return True
+        except Exception as e:
+            print(f"❌ Erro ao enviar extrato: {e}")
+            return False
 
     # ------------------------------------------------------------------
 
@@ -498,11 +614,14 @@ class YouTubeMonitor:
 
         videos = self.monitor_channels(existing_channels)
 
-        if not videos:
+        added = []
+        if videos:
+            added = self.add_to_sheets(videos, worksheet, existing_links)
+        else:
             print("ℹ️  Nenhum vídeo novo encontrado")
-            return
 
-        self.add_to_sheets(videos, worksheet, existing_links)
+        # Extrato diário por e-mail (enviado sempre, mesmo sem novidades)
+        self.send_digest_email(added)
 
         print("\n✨ Monitoramento concluído!")
 

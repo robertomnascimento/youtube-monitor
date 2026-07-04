@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
 YouTube Channel Monitor
-Monitora canais do YouTube, gera resumos com Claude e envia por e-mail
+Monitora canais do YouTube, gera resumos com Claude e alimenta Google Sheets
 """
 
 import os
 import json
-import smtplib
+import requests
 from datetime import datetime, timedelta, timezone
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.oauth2.service_account import Credentials
 from anthropic import Anthropic
+import gspread
 
 
 class YouTubeMonitor:
@@ -22,8 +21,10 @@ class YouTubeMonitor:
         self.youtube = None
         self.gmail = None
         self.drive = None
+        self.sheets = None
         self.config = self.load_config()
         self.setup_google_apis()
+        self.hubspot_api_key = os.getenv("HUBSPOT_API_KEY", "")
 
     def load_config(self):
         """Carrega configuração do arquivo JSON"""
@@ -33,15 +34,10 @@ class YouTubeMonitor:
                 return json.load(f)
         except FileNotFoundError:
             print(f"⚠️  Arquivo {config_file} não encontrado!")
-            return {"channels": [], "email_to": ""}
+            return {"channels": [], "email_to": "", "spreadsheet_id": ""}
 
     def setup_google_apis(self):
-        """Configura APIs do Google usando credenciais de conta de serviço.
-
-        IMPORTANTE: Para envio de e-mail via Gmail com service account é necessário
-        configurar delegação de domínio (Google Workspace) e informar 'delegated_email'
-        no config.json. Para contas Gmail pessoais, utilize OAuth 2.0.
-        """
+        """Configura APIs do Google usando credenciais de conta de serviço"""
         credentials_path = os.getenv(
             "GOOGLE_CREDENTIALS_PATH", "credentials/google_credentials.json"
         )
@@ -55,22 +51,22 @@ class YouTubeMonitor:
             scopes=[
                 "https://www.googleapis.com/auth/youtube.readonly",
                 "https://www.googleapis.com/auth/drive.file",
+                "https://www.googleapis.com/auth/spreadsheets",
             ],
         )
 
-        # Delegação de domínio — necessária para Gmail via service account
         delegated_email = self.config.get("delegated_email")
         if delegated_email:
             credentials = credentials.with_subject(delegated_email)
 
         self.youtube = build("youtube", "v3", credentials=credentials)
         self.drive = build("drive", "v3", credentials=credentials)
+        self.sheets = gspread.authorize(credentials)
         print("✅ APIs Google configuradas")
 
     def get_channel_id(self, channel_handle):
         """Obtém o ID do canal a partir do handle (@usuario)"""
         try:
-            # forHandle é a forma correta e precisa de buscar por handle
             response = (
                 self.youtube.channels()
                 .list(part="id", forHandle=channel_handle)
@@ -82,11 +78,11 @@ class YouTubeMonitor:
             print(f"❌ Erro ao buscar canal {channel_handle}: {e}")
         return None
 
-    def get_recent_videos(self, channel_id, hours=24):
-        """Busca vídeos publicados nas últimas N horas"""
+    def get_recent_videos(self, channel_id, days=34):
+        """Busca vídeos publicados nos últimos N dias (padrão: desde 01 junho)"""
         try:
             published_after = (
-                datetime.now(timezone.utc) - timedelta(hours=hours)
+                datetime.now(timezone.utc) - timedelta(days=days)
             ).isoformat()
 
             response = (
@@ -97,7 +93,7 @@ class YouTubeMonitor:
                     publishedAfter=published_after,
                     order="date",
                     type="video",
-                    maxResults=10,
+                    maxResults=50,
                 )
                 .execute()
             )
@@ -111,6 +107,7 @@ class YouTubeMonitor:
                         "video_id": item["id"]["videoId"],
                         "published_at": item["snippet"]["publishedAt"],
                         "channel_title": item["snippet"]["channelTitle"],
+                        "channel_handle": item["snippet"]["channelId"],
                     }
                 )
             return videos
@@ -118,12 +115,12 @@ class YouTubeMonitor:
             print(f"❌ Erro ao buscar vídeos: {e}")
             return []
 
-    def summarize_video(self, title, description):
-        """Gera resumo do vídeo usando Claude com prompt caching"""
+    def extract_video_info(self, title, description):
+        """Extrai informações do vídeo usando Claude"""
         try:
             message = self.claude.messages.create(
                 model="claude-sonnet-4-5",
-                max_tokens=300,
+                max_tokens=500,
                 messages=[
                     {
                         "role": "user",
@@ -131,11 +128,16 @@ class YouTubeMonitor:
                             {
                                 "type": "text",
                                 "text": (
-                                    f"Faça um resumo conciso (2-3 linhas) deste vídeo "
-                                    f"do YouTube em português:\n\n"
+                                    f"Analise este vídeo do YouTube e extraia as informações em JSON:\n\n"
                                     f"Título: {title}\n"
                                     f"Descrição: {description}\n\n"
-                                    f"Resumo:"
+                                    f"Retorne um JSON com:\n"
+                                    f"- assunto: tema principal (máx 50 caracteres)\n"
+                                    f"- resumo: resumo curto (2-3 linhas)\n"
+                                    f"- entrevistado: nome da pessoa entrevistada (se houver, senão null)\n"
+                                    f"- empresa_mencionada: empresa mencionada (se houver, senão null)\n"
+                                    f"\n"
+                                    f"Retorne APENAS o JSON, sem explicações."
                                 ),
                                 "cache_control": {"type": "ephemeral"},
                             }
@@ -143,10 +145,137 @@ class YouTubeMonitor:
                     }
                 ],
             )
-            return message.content[0].text.strip()
+
+            try:
+                result = json.loads(message.content[0].text.strip())
+                return result
+            except json.JSONDecodeError:
+                return {
+                    "assunto": title[:50],
+                    "resumo": description[:200],
+                    "entrevistado": None,
+                    "empresa_mencionada": None
+                }
         except Exception as e:
-            print(f"❌ Erro ao resumir: {e}")
-            return "Não foi possível gerar resumo"
+            print(f"❌ Erro ao extrair informações: {e}")
+            return {
+                "assunto": title[:50],
+                "resumo": description[:200],
+                "entrevistado": None,
+                "empresa_mencionada": None
+            }
+
+    def search_hubspot_contact(self, email_or_name):
+        """Busca contato no Hubspot"""
+        if not self.hubspot_api_key:
+            return None, False
+
+        try:
+            # Buscar por email
+            if "@" in str(email_or_name):
+                url = f"https://api.hubapi.com/crm/v3/objects/contacts/search"
+                payload = {
+                    "filterGroups": [
+                        {
+                            "filters": [
+                                {
+                                    "propertyName": "email",
+                                    "operator": "EQ",
+                                    "value": email_or_name
+                                }
+                            ]
+                        }
+                    ]
+                }
+            else:
+                # Buscar por nome
+                url = f"https://api.hubapi.com/crm/v3/objects/contacts/search"
+                payload = {
+                    "filterGroups": [
+                        {
+                            "filters": [
+                                {
+                                    "propertyName": "firstname",
+                                    "operator": "CONTAINS",
+                                    "value": email_or_name
+                                }
+                            ]
+                        }
+                    ]
+                }
+
+            headers = {
+                "Authorization": f"Bearer {self.hubspot_api_key}",
+                "Content-Type": "application/json"
+            }
+
+            response = requests.post(url, json=payload, headers=headers)
+            if response.status_code == 200 and response.json().get("results"):
+                contact = response.json()["results"][0]
+                owner_id = contact.get("properties", {}).get("hubspot_owner_id")
+                return contact["id"], True
+            return None, False
+        except Exception as e:
+            print(f"⚠️  Erro ao buscar Hubspot: {e}")
+            return None, False
+
+    def search_hubspot_company(self, company_name):
+        """Busca empresa no Hubspot"""
+        if not self.hubspot_api_key:
+            return None, False
+
+        try:
+            url = "https://api.hubapi.com/crm/v3/objects/companies/search"
+            payload = {
+                "filterGroups": [
+                    {
+                        "filters": [
+                            {
+                                "propertyName": "name",
+                                "operator": "CONTAINS",
+                                "value": company_name
+                            }
+                        ]
+                    }
+                ]
+            }
+
+            headers = {
+                "Authorization": f"Bearer {self.hubspot_api_key}",
+                "Content-Type": "application/json"
+            }
+
+            response = requests.post(url, json=payload, headers=headers)
+            if response.status_code == 200 and response.json().get("results"):
+                company = response.json()["results"][0]
+                owner_id = company.get("properties", {}).get("hubspot_owner_id")
+                owner_name = self.get_hubspot_owner_name(owner_id) if owner_id else None
+                return company["id"], True, owner_name
+            return None, False, None
+        except Exception as e:
+            print(f"⚠️  Erro ao buscar empresa no Hubspot: {e}")
+            return None, False, None
+
+    def get_hubspot_owner_name(self, owner_id):
+        """Obtém nome do proprietário no Hubspot"""
+        if not self.hubspot_api_key or not owner_id:
+            return None
+
+        try:
+            url = f"https://api.hubapi.com/crm/v3/objects/users/{owner_id}"
+            headers = {
+                "Authorization": f"Bearer {self.hubspot_api_key}",
+                "Content-Type": "application/json"
+            }
+
+            response = requests.get(url, headers=headers)
+            if response.status_code == 200:
+                user = response.json()
+                return user.get("properties", {}).get("firstname", "")
+            return None
+        except Exception as e:
+            print(f"⚠️  Erro ao buscar proprietário: {e}")
+            return None
 
     def monitor_channels(self):
         """Monitora todos os canais e coleta vídeos novos"""
@@ -162,96 +291,85 @@ class YouTubeMonitor:
 
             videos = self.get_recent_videos(channel_id)
             if videos:
-                print(f"✅ Encontrados {len(videos)} vídeos novos")
+                print(f"✅ Encontrados {len(videos)} vídeos")
                 all_videos[channel_handle] = videos
             else:
-                print("ℹ️  Nenhum vídeo novo nas últimas 24h")
+                print("ℹ️  Nenhum vídeo encontrado")
 
         return all_videos
 
-    def create_email_body(self, videos_by_channel):
-        """Cria o corpo do e-mail com resumos em HTML"""
-        if not videos_by_channel:
-            return "<p>Nenhum vídeo novo nos canais monitorados.</p>"
+    def add_to_sheets(self, videos_by_channel):
+        """Adiciona vídeos à planilha Google Sheets"""
+        if not self.sheets:
+            print("⚠️  Google Sheets não configurado")
+            return
 
-        html = "<html><body style='font-family: Arial, sans-serif;'>"
-        html += (
-            f"<h2>📺 Resumo de Vídeos - "
-            f"{datetime.now().strftime('%d/%m/%Y')}</h2>"
-        )
-
-        for channel, videos in videos_by_channel.items():
-            html += f"<h3>@{channel}</h3>"
-            for video in videos:
-                summary = self.summarize_video(video["title"], video["description"])
-                html += f"""
-                <div style='border-left: 3px solid #1f1f1f; padding-left: 10px; margin: 15px 0;'>
-                    <p><strong>🎬 {video['title']}</strong></p>
-                    <p style='color: #666;'>{summary}</p>
-                    <p><small>📅 {video['published_at'][:10]}</small></p>
-                    <p><a href='https://youtube.com/watch?v={video["video_id"]}'>
-                        Assistir no YouTube →
-                    </a></p>
-                </div>
-                """
-
-        html += "</body></html>"
-        return html
-
-    def send_email(self, to_email, subject, html_body):
-        """Envia e-mail via SMTP do Gmail com senha de app"""
-        smtp_user = os.getenv("GMAIL_USER") or self.config.get("gmail_user", "")
-        smtp_password = os.getenv("GMAIL_APP_PASSWORD") or self.config.get("gmail_app_password", "")
-
-        if not smtp_user or not smtp_password:
-            print("⚠️  GMAIL_USER ou GMAIL_APP_PASSWORD não configurados")
-            return False
+        spreadsheet_id = os.getenv("GOOGLE_SHEETS_ID") or self.config.get("spreadsheet_id")
+        if not spreadsheet_id:
+            print("⚠️  GOOGLE_SHEETS_ID não configurado")
+            return
 
         try:
-            message = MIMEMultipart("alternative")
-            message["to"] = to_email
-            message["from"] = smtp_user
-            message["subject"] = subject
-            message.attach(MIMEText(html_body, "html"))
+            spreadsheet = self.sheets.open_by_key(spreadsheet_id)
+            worksheet = spreadsheet.sheet1
 
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-                server.login(smtp_user, smtp_password)
-                server.sendmail(smtp_user, to_email, message.as_string())
+            # Adiciona cabeçalho se vazio
+            if len(worksheet.get_all_values()) == 0:
+                headers = [
+                    "Data", "Canal Youtube", "Assunto", "Resumo", "Entrevistado",
+                    "Contato no Hubspot", "Empresa Entrevistada", "Empresa no Hubspot",
+                    "Observações", "Proprietário", "Link do Vídeo"
+                ]
+                worksheet.insert_row(headers, 1)
 
-            print(f"✅ E-mail enviado para {to_email}")
-            return True
+            # Adiciona vídeos
+            for channel_handle, videos in videos_by_channel.items():
+                for video in videos:
+                    # Extrai informações
+                    info = self.extract_video_info(video["title"], video["description"])
+
+                    # Busca contato e empresa no Hubspot
+                    contact_exists = False
+                    company_exists = False
+                    owner_name = None
+
+                    if info.get("entrevistado"):
+                        _, contact_exists = self.search_hubspot_contact(info["entrevistado"])
+
+                    if info.get("empresa_mencionada"):
+                        _, company_exists, owner_name = self.search_hubspot_company(info["empresa_mencionada"])
+
+                    # Formata data
+                    pub_date = video["published_at"].split("T")[0]
+
+                    # Cria observação
+                    observation = f"🎥 https://youtube.com/watch?v={video['video_id']}"
+                    if owner_name:
+                        observation += f" | @{owner_name}"
+
+                    # Prepara linha
+                    row = [
+                        pub_date,
+                        channel_handle,
+                        info.get("assunto", "")[:50],
+                        info.get("resumo", ""),
+                        info.get("entrevistado") or "",
+                        "Sim" if contact_exists else "Não",
+                        info.get("empresa_mencionada") or "",
+                        "Sim" if company_exists else "Não",
+                        observation,
+                        f"@{owner_name}" if owner_name else "",
+                        f"https://youtube.com/watch?v={video['video_id']}"
+                    ]
+
+                    # Adiciona à planilha
+                    worksheet.append_row(row)
+                    print(f"✅ Adicionado: {info.get('assunto', '')} - {channel_handle}")
+
+            print(f"✅ Planilha atualizada: {spreadsheet_id}")
+
         except Exception as e:
-            print(f"❌ Erro ao enviar e-mail: {e}")
-            return False
-
-    def save_to_drive(self, filename, filepath):
-        """Salva o resumo no Google Drive"""
-        if not self.drive:
-            print("⚠️  Google Drive não configurado")
-            return False
-
-        try:
-            folder_id = self.config.get("google_drive_folder_id")
-            if not folder_id:
-                print("⚠️  Google Drive Folder ID não configurado")
-                return False
-
-            file_metadata = {"name": filename, "parents": [folder_id]}
-
-            # MediaFileUpload é obrigatório para envio de arquivos via Drive API
-            media = MediaFileUpload(filepath, mimetype="text/html")
-
-            file = (
-                self.drive.files()
-                .create(body=file_metadata, media_body=media, fields="id")
-                .execute()
-            )
-
-            print(f"✅ Arquivo salvo no Google Drive: {filename} (id: {file.get('id')})")
-            return True
-        except Exception as e:
-            print(f"❌ Erro ao salvar no Drive: {e}")
-            return False
+            print(f"❌ Erro ao atualizar planilha: {e}")
 
     def run(self):
         """Executa o monitoramento completo"""
@@ -263,27 +381,8 @@ class YouTubeMonitor:
             print("ℹ️  Nenhum vídeo novo encontrado")
             return
 
-        email_body = self.create_email_body(videos)
-
-        # Envia e-mail
-        email = self.config.get("email_to")
-        subject = self.config.get("email_subject", "Resumo de Vídeos").format(
-            data=datetime.now().strftime("%d/%m/%Y")
-        )
-        if email:
-            self.send_email(email, subject, email_body)
-
-        # Salva localmente
-        os.makedirs("summaries", exist_ok=True)
-        filename = f"resumo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
-        filepath = f"summaries/{filename}"
-
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(email_body)
-        print(f"✅ Resumo salvo localmente: {filepath}")
-
-        # Salva no Drive (sem commitar no repositório)
-        self.save_to_drive(filename, filepath)
+        # Adiciona à planilha Google Sheets
+        self.add_to_sheets(videos)
 
         print("\n✨ Monitoramento concluído!")
 

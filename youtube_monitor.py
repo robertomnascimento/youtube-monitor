@@ -99,12 +99,30 @@ class YouTubeMonitor:
             )
 
             videos = []
+            video_ids = [
+                item["id"]["videoId"] for item in response.get("items", [])
+            ]
+
+            # A busca retorna descrições truncadas; videos().list traz a completa
+            full_desc = {}
+            if video_ids:
+                details = (
+                    self.youtube.videos()
+                    .list(part="snippet", id=",".join(video_ids))
+                    .execute()
+                )
+                for v in details.get("items", []):
+                    full_desc[v["id"]] = v["snippet"]["description"]
+
             for item in response.get("items", []):
+                vid = item["id"]["videoId"]
                 videos.append(
                     {
                         "title": item["snippet"]["title"],
-                        "description": item["snippet"]["description"],
-                        "video_id": item["id"]["videoId"],
+                        "description": full_desc.get(
+                            vid, item["snippet"]["description"]
+                        ),
+                        "video_id": vid,
                         "published_at": item["snippet"]["publishedAt"],
                         "channel_title": item["snippet"]["channelTitle"],
                         "channel_handle": item["snippet"]["channelId"],
@@ -115,8 +133,24 @@ class YouTubeMonitor:
             print(f"❌ Erro ao buscar vídeos: {e}")
             return []
 
+    @staticmethod
+    def parse_json_response(text):
+        """Extrai JSON da resposta do Claude, mesmo com cercas de código"""
+        text = text.strip()
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1:
+            raise json.JSONDecodeError("JSON não encontrado", text, 0)
+        return json.loads(text[start:end + 1])
+
     def extract_video_info(self, title, description):
         """Extrai informações do vídeo usando Claude"""
+        fallback = {
+            "assunto": title[:50],
+            "resumo": description[:200],
+            "entrevistado": None,
+            "empresa_mencionada": None,
+        }
         try:
             message = self.claude.messages.create(
                 model="claude-sonnet-4-5",
@@ -128,16 +162,19 @@ class YouTubeMonitor:
                             {
                                 "type": "text",
                                 "text": (
-                                    f"Analise este vídeo do YouTube e extraia as informações em JSON:\n\n"
+                                    f"Analise este vídeo de um canal do mercado imobiliário brasileiro "
+                                    f"e extraia as informações em JSON:\n\n"
                                     f"Título: {title}\n"
                                     f"Descrição: {description}\n\n"
-                                    f"Retorne um JSON com:\n"
-                                    f"- assunto: tema principal (máx 50 caracteres)\n"
-                                    f"- resumo: resumo curto (2-3 linhas)\n"
-                                    f"- entrevistado: nome da pessoa entrevistada (se houver, senão null)\n"
-                                    f"- empresa_mencionada: empresa mencionada (se houver, senão null)\n"
-                                    f"\n"
-                                    f"Retorne APENAS o JSON, sem explicações."
+                                    f"Retorne um JSON com estes campos:\n"
+                                    f'- "assunto": tema principal (máx 50 caracteres)\n'
+                                    f'- "resumo": resumo curto (2-3 linhas)\n'
+                                    f'- "entrevistado": nome completo da pessoa entrevistada ou que dá depoimento. '
+                                    f"Procure com atenção no título e na descrição por nomes de pessoas "
+                                    f"(convidados, especialistas, clientes, diretores). Se realmente não houver, use null\n"
+                                    f'- "empresa_mencionada": nome da imobiliária/empresa entrevistada ou citada '
+                                    f"(ignore a empresa dona do canal). Se não houver, use null\n\n"
+                                    f"Responda somente com o JSON puro, sem cercas de código e sem explicações."
                                 ),
                                 "cache_control": {"type": "ephemeral"},
                             }
@@ -147,23 +184,13 @@ class YouTubeMonitor:
             )
 
             try:
-                result = json.loads(message.content[0].text.strip())
-                return result
+                return self.parse_json_response(message.content[0].text)
             except json.JSONDecodeError:
-                return {
-                    "assunto": title[:50],
-                    "resumo": description[:200],
-                    "entrevistado": None,
-                    "empresa_mencionada": None
-                }
+                print(f"⚠️  Resposta do Claude não era JSON válido para: {title[:60]}")
+                return fallback
         except Exception as e:
             print(f"❌ Erro ao extrair informações: {e}")
-            return {
-                "assunto": title[:50],
-                "resumo": description[:200],
-                "entrevistado": None,
-                "empresa_mencionada": None
-            }
+            return fallback
 
     def search_hubspot_contact(self, email_or_name):
         """Busca contato no Hubspot"""
@@ -171,38 +198,9 @@ class YouTubeMonitor:
             return None, False
 
         try:
-            # Buscar por email
-            if "@" in str(email_or_name):
-                url = f"https://api.hubapi.com/crm/v3/objects/contacts/search"
-                payload = {
-                    "filterGroups": [
-                        {
-                            "filters": [
-                                {
-                                    "propertyName": "email",
-                                    "operator": "EQ",
-                                    "value": email_or_name
-                                }
-                            ]
-                        }
-                    ]
-                }
-            else:
-                # Buscar por nome
-                url = f"https://api.hubapi.com/crm/v3/objects/contacts/search"
-                payload = {
-                    "filterGroups": [
-                        {
-                            "filters": [
-                                {
-                                    "propertyName": "firstname",
-                                    "operator": "CONTAINS",
-                                    "value": email_or_name
-                                }
-                            ]
-                        }
-                    ]
-                }
+            url = "https://api.hubapi.com/crm/v3/objects/contacts/search"
+            # "query" faz busca livre em nome, sobrenome e e-mail
+            payload = {"query": str(email_or_name), "limit": 1}
 
             headers = {
                 "Authorization": f"Bearer {self.hubspot_api_key}",
@@ -212,7 +210,6 @@ class YouTubeMonitor:
             response = requests.post(url, json=payload, headers=headers)
             if response.status_code == 200 and response.json().get("results"):
                 contact = response.json()["results"][0]
-                owner_id = contact.get("properties", {}).get("hubspot_owner_id")
                 return contact["id"], True
             return None, False
         except Exception as e:
@@ -227,17 +224,9 @@ class YouTubeMonitor:
         try:
             url = "https://api.hubapi.com/crm/v3/objects/companies/search"
             payload = {
-                "filterGroups": [
-                    {
-                        "filters": [
-                            {
-                                "propertyName": "name",
-                                "operator": "CONTAINS",
-                                "value": company_name
-                            }
-                        ]
-                    }
-                ]
+                "query": str(company_name),
+                "limit": 1,
+                "properties": ["name", "hubspot_owner_id"],
             }
 
             headers = {
@@ -262,7 +251,7 @@ class YouTubeMonitor:
             return None
 
         try:
-            url = f"https://api.hubapi.com/crm/v3/objects/users/{owner_id}"
+            url = f"https://api.hubapi.com/crm/v3/owners/{owner_id}"
             headers = {
                 "Authorization": f"Bearer {self.hubspot_api_key}",
                 "Content-Type": "application/json"
@@ -270,8 +259,11 @@ class YouTubeMonitor:
 
             response = requests.get(url, headers=headers)
             if response.status_code == 200:
-                user = response.json()
-                return user.get("properties", {}).get("firstname", "")
+                owner = response.json()
+                first = owner.get("firstName", "")
+                last = owner.get("lastName", "")
+                name = f"{first} {last}".strip()
+                return name or None
             return None
         except Exception as e:
             print(f"⚠️  Erro ao buscar proprietário: {e}")

@@ -9,7 +9,11 @@
     "CorretorConteudoIbrep",
     "apresentame",
     "relacionamentoparceiros5768",
-    "comprealugueagora"
+    "comprealugueagora",
+    "ValorizacaoImobiliaria"
+  ],
+  "full_history_channels": [
+    "ValorizacaoImobiliaria"
   ],
   "email_to": "roberto@pipeimob.com.br",
   "email_subject": "Resumo de Vídeos do YouTube - {data}",

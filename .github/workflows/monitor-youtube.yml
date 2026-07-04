@@ -23,9 +23,12 @@ jobs:
         pip install -r requirements.txt
 
     - name: Create Google Credentials
+      env:
+        GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
       run: |
         mkdir -p credentials
-        echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials/google_credentials.json
+        printf '%s' "$GOOGLE_CREDENTIALS" > credentials/google_credentials.json
+        python -c "import json; json.load(open('credentials/google_credentials.json'))" && echo "✅ JSON válido"
 
     - name: Run YouTube Monitor
       env:

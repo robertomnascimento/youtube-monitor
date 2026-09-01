@@ -58,6 +58,13 @@ def video_id_from_link(link):
 # registro devolvido (ou vice-versa).
 # ----------------------------------------------------------------------
 
+TOKENS_GENERICOS = {
+    "imoveis", "imovel", "imobiliaria", "imobiliarias", "consultoria", "ltda",
+    "grupo", "negocios", "empreendimentos", "administradora", "corretora",
+    "predial", "assessoria", "servicos", "solucoes", "brasil", "eireli",
+    "participacoes", "incorporadora", "construtora", "holding",
+}
+
 NOMES_GENERICOS = {
     "google", "plaza", "grupo", "imobiliaria", "imoveis", "construtora",
     "brasil", "cub", "urbs", "youtube", "instagram", "whatsapp", "chatgpt",
@@ -68,6 +75,15 @@ def norm(txt):
     txt = unicodedata.normalize("NFKD", txt or "")
     txt = txt.encode("ascii", "ignore").decode("ascii")
     return re.sub(r"[^a-z0-9 ]+", " ", txt.lower()).strip()
+
+
+def eh_dona_do_canal(empresa, canal):
+    """O prompt manda ignorar a empresa dona do canal; a IA às vezes a extrai."""
+    e = norm(empresa).replace(" ", "")
+    c = norm(canal).replace(" ", "")
+    if not e or not c:
+        return False
+    return e in c or c in e
 
 
 def match_confiavel(extraido, encontrado):
@@ -84,7 +100,11 @@ def match_confiavel(extraido, encontrado):
     if re.search(rf"\b{re.escape(b)}\b", a):
         return True, "ok (nome do Hubspot contido no extraído)"
     tokens = [t for t in a.split() if len(t) >= 4]
-    if tokens and all(re.search(rf"\b{re.escape(t)}\b", b) for t in tokens):
+    distintivos = [t for t in tokens if t not in TOKENS_GENERICOS]
+    if not distintivos:
+        return False, (f"só casaria por palavra genérica → Hubspot devolveu "
+                       f"'{encontrado}'")
+    if all(re.search(rf"\b{re.escape(t)}\b", b) for t in tokens):
         return True, "ok (todos os tokens)"
     return False, f"divergente → Hubspot devolveu '{encontrado}'"
 
@@ -235,9 +255,15 @@ class Backfiller(YouTubeMonitor):
 
             if info.get("empresa_mencionada"):
                 stats["com_empresa"] += 1
-                company_id, company_exists, owner_id, owner_name, motivo = (
-                    self.search_company_validated(info["empresa_mencionada"])
-                )
+                if eh_dona_do_canal(info["empresa_mencionada"], a["canal"]):
+                    company_id = owner_id = owner_name = None
+                    company_exists = False
+                    motivo = (f"é a dona do canal @{a['canal']} — o prompt manda "
+                              f"ignorar")
+                else:
+                    company_id, company_exists, owner_id, owner_name, motivo = (
+                        self.search_company_validated(info["empresa_mencionada"])
+                    )
                 if company_exists:
                     stats["empresa_sim"] += 1
                 elif not motivo.startswith("sem resultado"):

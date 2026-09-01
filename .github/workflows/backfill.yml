@@ -1,0 +1,61 @@
+name: Backfill janela sem credito
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'true = so relata, nada e escrito'
+        required: true
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+      start_date:
+        description: 'Data inicial (YYYY-MM-DD)'
+        required: true
+        default: '2026-07-30'
+      end_date:
+        description: 'Data final (YYYY-MM-DD)'
+        required: true
+        default: '2026-09-01'
+      skip_hubspot_notes:
+        description: 'true = preenche planilha mas NAO cria notas no Hubspot'
+        required: true
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Create Google Credentials
+      env:
+        GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+      run: |
+        mkdir -p credentials
+        printf '%s' "$GOOGLE_CREDENTIALS" > credentials/google_credentials.json
+        python -c "import json; json.load(open('credentials/google_credentials.json'))" && echo "✅ JSON válido"
+
+    - name: Run backfill
+      env:
+        CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+        GOOGLE_CREDENTIALS_PATH: credentials/google_credentials.json
+        CONFIG_FILE: config.json
+        HUBSPOT_API_KEY: ${{ secrets.HUBSPOT_API_KEY }}
+        DRY_RUN: ${{ inputs.dry_run }}
+        START_DATE: ${{ inputs.start_date }}
+        END_DATE: ${{ inputs.end_date }}
+        SKIP_HUBSPOT_NOTES: ${{ inputs.skip_hubspot_notes }}
+      run: python backfill.py

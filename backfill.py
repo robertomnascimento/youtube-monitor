@@ -17,8 +17,10 @@ Uso:
 """
 
 import os
+import re
 import sys
 import time
+import unicodedata
 from datetime import datetime, timezone
 
 import requests
@@ -45,7 +47,77 @@ def video_id_from_link(link):
     return link.split("watch?v=")[1].split("&")[0].strip()
 
 
+
+# ----------------------------------------------------------------------
+# Validação de match no Hubspot
+#
+# O search do Hubspot usa `query` (substring em nome, domínio, telefone) com
+# limit=1. Isso produz falsos positivos graves: "Google" casa CONSTRUTORA
+# MASHIA (domínio business.google.com) e "CUB" casa cartórios de Cubatão.
+# Só aceitamos o match se o nome extraído aparecer como token no nome do
+# registro devolvido (ou vice-versa).
+# ----------------------------------------------------------------------
+
+NOMES_GENERICOS = {
+    "google", "plaza", "grupo", "imobiliaria", "imoveis", "construtora",
+    "brasil", "cub", "urbs", "youtube", "instagram", "whatsapp", "chatgpt",
+}
+
+
+def norm(txt):
+    txt = unicodedata.normalize("NFKD", txt or "")
+    txt = txt.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9 ]+", " ", txt.lower()).strip()
+
+
+def match_confiavel(extraido, encontrado):
+    """(ok, motivo) — extraido = o que a IA disse, encontrado = nome no Hubspot."""
+    a, b = norm(extraido), norm(encontrado)
+    if not a or not b:
+        return False, "nome vazio"
+    if len(a.replace(" ", "")) < 4:
+        return False, f"sigla curta demais ('{extraido}')"
+    if a in NOMES_GENERICOS:
+        return False, f"nome genérico ('{extraido}')"
+    if re.search(rf"\b{re.escape(a)}\b", b):
+        return True, "ok"
+    if re.search(rf"\b{re.escape(b)}\b", a):
+        return True, "ok (nome do Hubspot contido no extraído)"
+    tokens = [t for t in a.split() if len(t) >= 4]
+    if tokens and all(re.search(rf"\b{re.escape(t)}\b", b) for t in tokens):
+        return True, "ok (todos os tokens)"
+    return False, f"divergente → Hubspot devolveu '{encontrado}'"
+
+
 class Backfiller(YouTubeMonitor):
+    def search_company_validated(self, nome_extraido):
+        """Busca empresa e valida o match. Devolve (id, ok, owner_id, owner_name, motivo)."""
+        if not self.hubspot_api_key:
+            return None, False, None, None, "sem chave do Hubspot"
+        try:
+            r = requests.post(
+                "https://api.hubapi.com/crm/v3/objects/companies/search",
+                json={"query": str(nome_extraido), "limit": 1,
+                      "properties": ["name", "hubspot_owner_id"]},
+                headers={"Authorization": f"Bearer {self.hubspot_api_key}",
+                         "Content-Type": "application/json"},
+            )
+            if r.status_code != 200:
+                return None, False, None, None, f"Hubspot {r.status_code}"
+            results = r.json().get("results") or []
+            if not results:
+                return None, False, None, None, "sem resultado"
+            comp = results[0]
+            nome_hs = comp.get("properties", {}).get("name", "")
+            ok, motivo = match_confiavel(nome_extraido, nome_hs)
+            if not ok:
+                return None, False, None, None, motivo
+            owner_id = comp.get("properties", {}).get("hubspot_owner_id")
+            owner_name = self.get_hubspot_owner_name(owner_id) if owner_id else None
+            return comp["id"], True, owner_id, owner_name, f"ok → '{nome_hs}'"
+        except Exception as e:
+            return None, False, None, None, f"erro: {e}"
+
     def fetch_snippets(self, video_ids):
         """Busca title/description/publishedAt em lotes de 50."""
         out = {}
@@ -135,9 +207,10 @@ class Backfiller(YouTubeMonitor):
 
         updates = []
         notas_previstas = []
+        rejeitados = []
         stats = {"extraido": 0, "sem_video": 0, "com_entrev": 0,
                  "com_empresa": 0, "contato_sim": 0, "empresa_sim": 0,
-                 "notas_criadas": 0}
+                 "notas_criadas": 0, "match_rejeitado": 0}
 
         for a in alvos:
             sn = snippets.get(a["vid"])
@@ -162,11 +235,14 @@ class Backfiller(YouTubeMonitor):
 
             if info.get("empresa_mencionada"):
                 stats["com_empresa"] += 1
-                company_id, company_exists, owner_id, owner_name = (
-                    self.search_hubspot_company(info["empresa_mencionada"])
+                company_id, company_exists, owner_id, owner_name, motivo = (
+                    self.search_company_validated(info["empresa_mencionada"])
                 )
                 if company_exists:
                     stats["empresa_sim"] += 1
+                elif not motivo.startswith("sem resultado"):
+                    stats["match_rejeitado"] += 1
+                    rejeitados.append((a["linha"], info["empresa_mencionada"], motivo))
                 time.sleep(0.3)
 
             video_link = f"https://youtube.com/watch?v={a['vid']}"
@@ -199,7 +275,8 @@ class Backfiller(YouTubeMonitor):
                     "e não registrou este vídeo na época.</em></p>"
                 )
                 notas_previstas.append(
-                    (a["linha"], info["empresa_mencionada"], company_id, pub_br)
+                    (a["linha"], info["empresa_mencionada"], company_id, pub_br,
+                     motivo.replace("ok → ", "").strip("'"))
                 )
                 if not DRY_RUN:
                     if self.create_note_backdated(company_id, note_body,
@@ -242,16 +319,25 @@ class Backfiller(YouTubeMonitor):
         print(f"  └─ achado no Hubspot:        {stats['contato_sim']}")
         print(f"  com empresa:                 {stats['com_empresa']}")
         print(f"  └─ achada no Hubspot:        {stats['empresa_sim']}")
+        print(f"  matches rejeitados:          {stats['match_rejeitado']}")
         print(f"  notas a criar no Hubspot:    {len(notas_previstas)}")
         if not DRY_RUN:
             print(f"  notas efetivamente criadas:  {stats['notas_criadas']}")
         print("=" * 60)
 
         if notas_previstas:
-            print("\nEMPRESAS QUE RECEBERIAM NOTA:")
+            print("\nEMPRESAS QUE RECEBERIAM NOTA (extraído → registro no Hubspot):")
             from collections import Counter
-            for emp, qtd in Counter(n[1] for n in notas_previstas).most_common():
-                print(f"  {qtd:3}x  {emp}")
+            pares = Counter((n[1], n[4]) for n in notas_previstas)
+            for (emp, nome_hs), qtd in pares.most_common():
+                print(f"  {qtd:3}x  {emp}  →  {nome_hs}")
+
+        if rejeitados:
+            print("\nMATCHES REJEITADOS (nota NÃO seria criada):")
+            from collections import Counter
+            for (emp, motivo), qtd in Counter(
+                    (r[1], r[2]) for r in rejeitados).most_common():
+                print(f"  {qtd:3}x  {emp}: {motivo}")
         return 0
 
 

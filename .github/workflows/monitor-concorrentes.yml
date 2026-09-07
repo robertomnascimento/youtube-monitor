@@ -1,0 +1,74 @@
+name: Monitor Concorrentes (semanal)
+
+# Inteligência de produto: acompanha os canais dos CRMs concorrentes.
+# Separado do "YouTube Monitor Daily", que tem outro objetivo (entrevistados + HubSpot),
+# outra lista de canais e outra cadência. Os secrets são os mesmos.
+
+on:
+  schedule:
+    - cron: '0 11 * * 1'   # segunda-feira, 8h de Brasília (BRT = UTC-3)
+  workflow_dispatch:
+    inputs:
+      dias:
+        description: 'Janela de destaque no relatório (dias)'
+        required: false
+        default: '7'
+      email_sempre:
+        description: 'Enviar e-mail mesmo sem vídeos novos'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write          # para commitar o histórico de volta
+
+concurrency:
+  group: monitor-concorrentes
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Sem dependências: o script usa só a biblioteca padrão (urllib + xml).
+
+      - name: Rodar monitor
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: |
+          python concorrentes/monitor_concorrentes.py \
+            --dias "${{ github.event.inputs.dias || '7' }}" \
+            --email "${{ secrets.GMAIL_USER }}" \
+            ${{ github.event.inputs.email_sempre == 'true' && '--email-sempre' || '' }}
+
+      # O histórico é o estado do monitor: sem ele, todo vídeo parece novo
+      # a cada execução. Commitar de volta também deixa trilha de auditoria.
+      - name: Commitar histórico e relatório
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain concorrentes/historico_videos.csv concorrentes/relatorios)" ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add concorrentes/historico_videos.csv concorrentes/relatorios
+            git commit -m "chore(concorrentes): histórico de $(date -u +%Y-%m-%d)"
+            git push
+          else
+            echo "Nada mudou no histórico."
+          fi
+
+      - name: Publicar relatório como artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relatorio-concorrentes-${{ github.run_id }}
+          path: concorrentes/relatorios/
+          retention-days: 90
